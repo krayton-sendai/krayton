@@ -9,14 +9,51 @@ import numpy as np
 import matplotlib.pyplot as plt
 import pandas as pd
 import matplotlib.dates as mdates
+import csv
+import statistics
 
-buy_price=0.15    #Price for buying electricity
-sell_price=0.0524    #Price for selling electricity
 
 #dictionaries for storing information of pv, load, storage
 pv={}
 load={}
 storage={}
+
+def electricity_price_retail():
+    buy_price=np.tile([0.14658],52560)
+    sell_price=np.array([])
+    with open('sell_price.csv',newline='') as csvfile:
+        raw_electricity_price=csv.reader(csvfile,delimiter=',')
+        #Price of selling to grid
+        for line in raw_electricity_price:
+            sell_price=np.append(sell_price,float(line[0]))
+    sell_price=sell_price/100
+    m_list=np.zeros(48)
+    for t in range(len(sell_price)):
+        m_list[t%48]+=sell_price[t]
+    m_list=m_list/(len(sell_price)/48)
+    ax.plot(np.array(range(48))/2,m_list*100,label='octopus sell')
+#    fig,ax=plt.subplots()
+#    for t in range(int(len(sell_price)/48)-48):
+#        ax.plot(np.array(range(48))/2,sell_price[48*t:48*(t+1)])
+    return [buy_price,sell_price]
+
+def electricity_price_wholesale():
+    price=np.array([])       #Sell price always same as buy price
+    with open('sspsbpniv.csv',newline='') as csvfile:
+        raw_price=csv.reader(csvfile,delimiter=',')
+        for line in raw_price:
+            price=np.append(price,float(line[2])/1000)    
+    m_list=np.zeros(48)
+    for t in range(len(price)):
+        m_list[t%48]+=price[t]
+    m_list=m_list/(len(price)/48)
+#    fig,ax=plt.subplots()
+    ax.plot(np.array(range(48))/2,m_list*100,label='wholesale')
+#    fig,ax=plt.subplots()
+#    for t in range(int(len(price)/48)-48):
+#        ax.plot(np.array(range(48))/2,price[48*t:48*(t+1)])
+    price=np.tile(price,3)
+    return [price,price]
 
 def solar_data():
     #Read solar data from csv file
@@ -70,42 +107,9 @@ def solar_data_10():
     capacity_factor_half_hour_10=np.tile(capacity_factor_half_hour_10,3)
     return np.array(capacity_factor_half_hour_10)
 
-'''
-
-def load_data():
-    #Read load data from csv file
-    #scales UK demand by village demand
-    demand=[]
-#    uk_annual_demand=143e6*0.01163  #UK demand in toe, convert into GWh
-    village_annual_demand=11.88e6   #From our estimate, 120GWh per year
-#    village_daily_demand=village_annual_demand/365  #Assume same everyday for now
-    import csv
-    with open('uk_annual_demand_fliped.csv',newline='') as csvfile:
-#    with open('uk_demand_1108.csv',newline='') as csvfile:
-        raw_demand_data=csv.reader(csvfile,delimiter=',')
-        line=0
-        for row in raw_demand_data:
-            #Column 5 of demand data is half hourly capacity factor, starting from line 1
-            if line>=1:
-                demand.append(float(row[4]))
-            line+=1
-    #make weekly data into half hourly by linear approximating middle values
-    hourly_demand=[]
-    linear_list=np.array(range(336))
-    for week in range(len(demand)):
-        if week<len(demand)-1:
-            week_demand=demand[week]+(demand[week+1]-demand[week])*linear_list/336
-            hourly_demand=np.append(hourly_demand,week_demand)
-        else:
-            hourly_demand=np.append(hourly_demand,[demand[week]]*383)
-    #scale the total consumption to out predictied consumption
-    sum_hourly_demand=sum(hourly_demand)
-    scaled_demand=hourly_demand/sum_hourly_demand*village_annual_demand
-    return(scaled_demand)
-'''
 
 def residential():
-    village_annual_demand=236000*2*15
+    village_annual_demand=11.88e6
     profile_demand=np.zeros(365*48)
     t=0
     import csv
@@ -127,7 +131,8 @@ def load_heat_data():
     #Use shape of degree day curve, scale to estimated heating demand
     import csv
     degree_day=[]
-    village_annual_heat_demand=14e6
+    #Science park floor area 264000 Houses floor area 236000*2 hot water 3e6 passive house 15kWh/yr
+    village_annual_heat_demand=236000*2*15
     with open('2014degreedays.csv',newline='') as csvfile:
         raw_heat_demand_data=csv.reader(csvfile,delimiter=',')
         #Column 3 = HDD 10.5C, Column 4 = HDD 15.5C, Column 5 = HDD 18.5C, starting from line 1
@@ -196,7 +201,59 @@ def create_storage(storage,capacity,power,efficiency,initial_cost):
     storage[storageid]['stored']=[0]                #start with empty storage
     return storage
 
-def energy_system(pv,load,storage):
+def energy_system_wholesale_opt(pv,load,storage,buy_price,sell_price):
+    total_output=np.array([0]*len(pv[0]['output']),dtype=float)
+    for pvid in pv:
+        total_output+=pv[pvid]['output']
+    total_load=np.array([0]*len(load[0]),dtype=float)
+    for loadid in load:
+        total_load+=np.array(load[loadid])
+    excess=total_output-total_load                  #Calculate excess power before using storage
+    storage_time=0                                  #At time 0, storage has no charge. Storage records the charge avaliable for this time slot
+    buy=[]                                          #Power bought from market, negative means sold
+    balancing=[]                                    #Record power taken or given by storage to meet excess power, after accounting efficiency
+    sum_sell_price=0                                #Record of previous sum to calculate mean
+    sell_i=0                                        #Record number of time slot when there is excess
+    sum_buy_price=0
+    buy_i=0
+    for dexcess in excess:                          #dexcess is the excess at this time slot
+        balancing.append(0)
+        for storageid in storage:                   #run through all storage facilities
+        #charge power is the amount charged to storage
+            if dexcess>=0:                          #pv > load
+                sum_sell_price+=buy_price[storage_time]
+                sell_i+=1
+                m_sell=sum_sell_price/sell_i                   #Mean only calculated by dividing the number of time we have excess generation
+                if sell_price[storage_time]<=m_sell:                    #selling price < median and selling price<buy price, storage charging
+                    charge_power=min(dexcess*storage[storageid]['efficiency'],storage[storageid]['capacity']-storage[storageid]['stored'][storage_time],storage[storageid]['power'])    #charge power is the lesser of dexcess or remaining space of storage 
+                    dexcess-=charge_power/storage[storageid]['efficiency']      #amount of power taken from dexcess, after accounting efficiency
+                    balancing[storage_time]-=charge_power/storage[storageid]['efficiency']
+                elif sell_price[storage_time]>0.058:                               #Sell all we can sell in storage when sell price > buy price
+                    charge_power=-min(storage[storageid]['stored'][storage_time],storage[storageid]['power'])
+                    dexcess-=charge_power*storage[storageid]['efficiency']
+                    balancing[storage_time]-=charge_power*storage[storageid]['efficiency']
+                else:
+                    charge_power=0
+            else:                                   #pv < load
+                sum_buy_price+=buy_price[storage_time]
+                buy_i+=1
+                m_buy=sum_buy_price/buy_i
+                if sell_price[storage_time]>=m_buy:            #Use storage only when buying price>m
+                    charge_power=max(dexcess/storage[storageid]['efficiency'],-storage[storageid]['stored'][storage_time]*storage[storageid]['efficiency'],-storage[storageid]['power'])  #charge power is the less negative of dexcess or remaining charge
+                    dexcess-=charge_power*storage[storageid]['efficiency']      #amount of power given to dexcess, after accounting efficiency
+                    balancing[storage_time]-=charge_power*storage[storageid]['efficiency']
+                elif buy_price[storage_time]<0.043:
+                    charge_power=min(storage[storageid]['capacity']-storage[storageid]['stored'][storage_time],storage[storageid]['power'])
+                    dexcess-=charge_power*storage[storageid]['efficiency']
+                    balancing[storage_time]-=charge_power*storage[storageid]['efficiency']
+                else:                               #Else, buy from grid
+                    charge_power=0
+            storage[storageid]['stored'].append(storage[storageid]['stored'][storage_time]+charge_power)
+        storage_time+=1
+        buy.append(-dexcess)
+    return [buy,total_output,total_load,balancing]
+
+def energy_system_retail_opt(pv,load,storage,buy_price,sell_price):
     total_output=np.array([0]*len(pv[0]['output']),dtype=float)
     for pvid in pv:
         total_output+=pv[pvid]['output']
@@ -212,27 +269,37 @@ def energy_system(pv,load,storage):
         for storageid in storage:                   #run through all storage facilities
         #charge power is the amount charged to storage
             if dexcess>=0:                          #pv > load, storage charging
-                charge_power=min(dexcess*storage[storageid]['efficiency'],storage[storageid]['capacity']-storage[storageid]['stored'][storage_time],storage[storageid]['power'])    #charge power is the lesser of dexcess or remaining space of storage 
-                dexcess-=charge_power/storage[storageid]['efficiency']      #amount of power taken from dexcess, after accounting efficiency
-                balancing[storage_time]-=charge_power/storage[storageid]['efficiency']
+                if sell_price[storage_time]<=buy_price[storage_time]:       #Only charge when sell price<buy price
+                    charge_power=min(dexcess*storage[storageid]['efficiency'],storage[storageid]['capacity']-storage[storageid]['stored'][storage_time],storage[storageid]['power'])    #charge power is the lesser of dexcess or remaining space of storage 
+                    dexcess-=charge_power/storage[storageid]['efficiency']      #amount of power taken from dexcess, after accounting efficiency
+                    balancing[storage_time]-=charge_power/storage[storageid]['efficiency']
+                elif sell_price[storage_time]<=sell_price[storage_time-1]:       #Sell everything when buy price>sell price
+                    charge_power=-min(storage[storageid]['power'],storage[storageid]['stored'][storage_time])
+                    dexcess-=charge_power/storage[storageid]['efficiency']      #amount of power taken from dexcess, after accounting efficiency
+                    balancing[storage_time]-=charge_power/storage[storageid]['efficiency']                    
             else:                                   #pv < load, storage discharging
-                charge_power=max(dexcess/storage[storageid]['efficiency'],-storage[storageid]['stored'][storage_time],-storage[storageid]['power'])  #charge power is the less negative of dexcess or remaining charge
-                dexcess-=charge_power*storage[storageid]['efficiency']      #amount of power given to dexcess, after accounting efficiency
-                balancing[storage_time]-=charge_power*storage[storageid]['efficiency']
+                if buy_price[storage_time]>sell_price[storage_time]:        #Only use storage when buy price<sell price
+                    charge_power=max(dexcess/storage[storageid]['efficiency'],-storage[storageid]['stored'][storage_time],-storage[storageid]['power'])  #charge power is the less negative of dexcess or remaining charge
+                    dexcess-=charge_power*storage[storageid]['efficiency']      #amount of power given to dexcess, after accounting efficiency
+                    balancing[storage_time]-=charge_power*storage[storageid]['efficiency']
+                else:
+                    charge_power=0
             storage[storageid]['stored'].append(storage[storageid]['stored'][storage_time]+charge_power)
         storage_time+=1
         buy.append(-dexcess)
     return [buy,total_output,total_load,balancing]
 
+
+'''
 def plot_demand(total_output,total_load,balancing):
-    year_output=total_output[-21504:-21456]
-    year_load=total_load[-21504:-21456]
+    year_output=total_output[-21504:-3985]
+    year_load=total_load[-21504:-3985]
     total_energy_production=sum(year_output)
     total_energy_consumption=sum(year_load)
     print(total_energy_consumption/total_energy_production)
     print('Total energy production is ',total_energy_production,'kWh Total energy consumption is ',total_energy_consumption,'kWh')
     time_list=pd.date_range(start='2015-01-01',end='2015-12-31',periods=len(year_load))
-    year_balancing=np.array(balancing[-21504:-21456])
+    year_balancing=np.array(balancing[-21504:-3985])
     labels=['total output','storage operation']
     fig,ax=plt.subplots()
     fmt=mdates.DateFormatter('%b')
@@ -244,15 +311,15 @@ def plot_demand(total_output,total_load,balancing):
     plt.xlabel('time')
     fig.legend()
     plt.show()
-    
+'''    
 
 def market(buy,sell_price,buy_price):
     cost=0
-    for energy in buy:
-        if energy <0:
-            price=energy*sell_price
+    for t in range(len(buy)):
+        if buy[t] <0:
+            price=buy[t]*sell_price[t]
         else:
-            price=energy*buy_price
+            price=buy[t]*buy_price[t]
         cost+=price
     return cost
 
@@ -263,22 +330,46 @@ def captial_cost(pv,storage):
     for storageid in storage:
         cost+=storage[storageid]['initial_cost']
     return cost
-
-
+'''
+#Minimize runnging cost for houses
+#Create load by create_load(load,list of load power in time)
+heat_demand=load_heat_data()
+load=create_load(load,residential())
+load=create_load(load,heat_demand)
 #Create pv assest by create_pv(pv,capacity,initial_cost,capacity_factor)
 pv=create_pv(pv,46000,46000*56.95,solar_data())
 #pv=create_pv(pv,17600,10*17600,solar_data_flat())
 #pv=create_pv(pv,2400,10*2400,solar_data_10())
+
+#Create storage by create_storage(stroage,capacity,charge and discharge power, efficiency,initial cost)
+#Optimum storage for houses with maximum amount of PV in an unoptimize system = 17000kWh
+storage=create_storage({},17000,17000,1,17000*15)
+[buy,total_output,total_load,balancing]=energy_system_retail_opt(pv,load,storage,buy_price,sell_price)
+running_cost=market(buy[-21504:-3985],sell_price[-21504:-3985],buy_price)
+initial_cost=captial_cost(pv,storage)
+total_cost=running_cost+initial_cost
+print(running_cost)
+'''
+
+#Generation of Science Park roughly equal to demand so assume maximum amount of PV on science park
+#Uncomment below to get battery size with minimum total cost
+
+[buy_price,sell_price]=electricity_price_retail()
 #Create load by create_load(load,list of load power in time)
 heat_demand=load_heat_data()
 load=create_load(load,residential())
 load=create_load(load,heat_demand)
 #load=create_load(load,load_sciencepark())
+#Create pv assest by create_pv(pv,capacity,initial_cost,capacity_factor)
+pv=create_pv(pv,46000,46000*10,solar_data())
+#pv=create_pv(pv,17600,10*17600!,solar_data_flat())
+#pv=create_pv(pv,2400,10*2400,solar_data_10())
+
 #Create storage by create_storage(stroage,capacity,charge and discharge power, efficiency,initial cost)
-storage=create_storage(storage,54000,54000,1,54000*15)
-[buy,total_output,total_load,balancing]=energy_system(pv,load,storage)
-running_cost=market(buy,sell_price,buy_price)
+#Optimum storage for science park in an unoptimize system = 10000kWh
+storage=create_storage({},10000,10000,1,10000*15)
+[buy,total_output,total_load,balancing]=energy_system(pv,load,storage,buy_price,sell_price)
+running_cost=market(buy[-21504:-3985],sell_price[-21504:-3985],buy_price)
 initial_cost=captial_cost(pv,storage)
 total_cost=running_cost+initial_cost
-plot_demand(total_output,total_load,balancing)
-print('Operating cost is ',running_cost, ', initial cost is ',initial_cost,', total cost is ',total_cost)
+print(running_cost)
